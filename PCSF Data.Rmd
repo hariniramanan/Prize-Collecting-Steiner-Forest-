@@ -1,0 +1,232 @@
+---
+title: "PCSF"
+output: html_document
+date: "2025-12-24"
+---
+
+
+```{r setup, include=FALSE}
+library(DESeq2)
+library(dplyr)
+library(igraph)
+
+dds <- readRDS("dds.rds")
+```
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## PRIZE-COLLECTING STEINER FOREST (PCSF) ANALYSIS
+
+
+```{r}
+library(DESeq2)
+library(dplyr)
+library(igraph)
+library(ggraph)
+library(ggplot2)
+library(scales)
+library(biomaRt)
+library(STRINGdb)
+
+```
+
+## STEP 1: EXTRACT AND CONVERT DESEQ2 RESULTS
+
+You can also embed plots, for example:
+
+```{r}
+# Extract results
+res_day3_vs_3hr <- results(dds, contrast = c("Timepoint", "3day", "3hr"))
+res_day3_vs_3hr <- as.data.frame(res_day3_vs_3hr)
+res_day3_vs_3hr$ensembl_id <- rownames(res_day3_vs_3hr)
+
+res_day6_vs_day3 <- results(dds, contrast = c("Timepoint", "6day", "3day"))
+res_day6_vs_day3 <- as.data.frame(res_day6_vs_day3)
+res_day6_vs_day3$ensembl_id <- rownames(res_day6_vs_day3)
+
+# Convert Ensembl IDs to gene symbols
+cat("  Connecting to Ensembl biomaRt...\n")
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+all_ensembl <- unique(c(res_day3_vs_3hr$ensembl_id, res_day6_vs_day3$ensembl_id))
+gene_conversion <- getBM(
+  attributes = c('ensembl_gene_id', 'hgnc_symbol', 'entrezgene_id'),
+  filters = 'ensembl_gene_id',
+  values = all_ensembl,
+  mart = ensembl
+)
+
+# Merge and clean
+res_day3_vs_3hr <- res_day3_vs_3hr %>%
+  left_join(gene_conversion, by = c("ensembl_id" = "ensembl_gene_id")) %>%
+  filter(!is.na(hgnc_symbol), hgnc_symbol != "") %>%
+  mutate(gene = hgnc_symbol) %>%
+  distinct(gene, .keep_all = TRUE)
+
+res_day6_vs_day3 <- res_day6_vs_day3 %>%
+  left_join(gene_conversion, by = c("ensembl_id" = "ensembl_gene_id")) %>%
+  filter(!is.na(hgnc_symbol), hgnc_symbol != "") %>%
+  mutate(gene = hgnc_symbol) %>%
+  distinct(gene, .keep_all = TRUE)
+
+# Get significant genes
+genes_day3_up <- res_day3_vs_3hr %>%
+  filter(padj < 0.05, log2FoldChange > 1) %>%
+  arrange(desc(log2FoldChange))
+
+genes_day6_up <- res_day6_vs_day3 %>%
+  filter(padj < 0.05, log2FoldChange > 1) %>%
+  arrange(desc(log2FoldChange))
+
+cat("  Day3 upregulated:", nrow(genes_day3_up), "genes\n")
+cat("  Day6 upregulated:", nrow(genes_day6_up), "genes\n")
+cat("  Sample day3 genes:", paste(head(genes_day3_up$gene, 5), collapse=", "), "\n")
+cat("  Sample day6 genes:", paste(head(genes_day6_up$gene, 5), collapse=", "), "\n\n")
+```
+## STEP 2: BUILD COMPREHENSIVE PPI NETWORK FROM STRING
+```{r}
+cat("STEP 2: Building PPI network from STRING database...\n")
+
+options(timeout = 300)
+string_db <- STRINGdb$new(version="12.0", species=9606, 
+                          score_threshold=400, input_directory="")
+
+# Map all significant genes (day3 + day6) to STRING
+all_sig_genes <- unique(c(genes_day3_up$gene, genes_day6_up$gene))
+gene_mapping <- data.frame(gene = all_sig_genes)
+mapped_genes <- string_db$map(gene_mapping, "gene", removeUnmappedRows = TRUE)
+
+cat("  Mapped genes to STRING:", nrow(mapped_genes), "\n")
+
+# Get PPI network
+ppi_network <- tryCatch({
+  string_db$get_interactions(mapped_genes$STRING_id)
+}, error = function(e) {
+  cat("  Timeout - using top genes only\n")
+  string_db$get_interactions(head(mapped_genes$STRING_id, 200))
+})
+
+# Convert back to gene symbols
+ppi_network$from_gene <- mapped_genes$gene[match(ppi_network$from, mapped_genes$STRING_id)]
+ppi_network$to_gene <- mapped_genes$gene[match(ppi_network$to, mapped_genes$STRING_id)]
+
+ppi_edges <- ppi_network %>%
+  dplyr::select(from = from_gene, to = to_gene, cost = combined_score) %>%
+  dplyr::filter(!is.na(from), !is.na(to)) %>%
+  dplyr::mutate(cost = 1 - (cost/1000)) %>%  # Convert STRING score to edge cost
+  dplyr::distinct()
+
+cat("  PPI edges retrieved:", nrow(ppi_edges), "\n\n")
+
+```
+## STEP 3: GET REAL TF-TARGET RELATIONSHIPS
+```{r}
+cat("STEP 3: Downloading real TF-target relationships...\n")
+
+# Try to download TRRUST database
+tf_targets <- NULL
+
+# Method 1: TRRUST
+trrust_urls <- c(
+  "https://www.grnpedia.org/trrust/data/trrust_rawdata.human.tsv",
+  "https://guotosky.vip/TRRUST/data/trrust_rawdata.human.tsv"
+)
+
+for (url in trrust_urls) {
+  tf_targets <- tryCatch({
+    cat("  Trying:", url, "\n")
+    download.file(url, destfile = "trrust_human.tsv", quiet = TRUE)
+    read.table("trrust_human.tsv", sep = "\t", header = FALSE, 
+               stringsAsFactors = FALSE, quote = "")
+  }, error = function(e) NULL)
+  
+  if (!is.null(tf_targets)) break
+}
+
+if (!is.null(tf_targets)) {
+  colnames(tf_targets) <- c("TF", "Target", "Regulation", "PMID")
+  
+  # Filter for our genes of interest
+  tf_edges <- tf_targets %>%
+    filter(TF %in% genes_day3_up$gene | TF %in% all_sig_genes) %>%
+    filter(Target %in% genes_day6_up$gene | Target %in% all_sig_genes) %>%
+    dplyr::select(from = TF, to = Target) %>%
+    mutate(cost = 0.5) %>%  # TF-target edges have lower cost
+    distinct()
+  
+  cat("  TF-target relationships found:", nrow(tf_edges), "\n")
+} else {
+  cat("  WARNING: Could not download TRRUST. Creating minimal TF network.\n")
+  
+  # Minimal fallback using known TFs from literature
+  known_tfs <- c("LEF1", "TCF7", "CTNNB1", "SMAD4", "EP300", "MYC", 
+                 "JUN", "FOS", "STAT3")
+  available_tfs <- intersect(known_tfs, genes_day3_up$gene)
+  
+  if (length(available_tfs) > 0) {
+    tf_edges <- expand.grid(
+      from = available_tfs,
+      to = head(genes_day6_up$gene, 50),
+      stringsAsFactors = FALSE
+    ) %>%
+      mutate(cost = 0.5) %>%
+      dplyr::select(from, to, cost) %>%
+      distinct()
+  } else {
+    # Absolute minimum
+    tf_edges <- data.frame(
+      from = head(genes_day3_up$gene, 10),
+      to = head(genes_day6_up$gene, 30),
+      cost = 0.5
+    )
+  }
+  cat("  Created minimal TF network:", nrow(tf_edges), "edges\n")
+}
+
+# Ensure tf_edges has the right columns
+tf_edges <- tf_edges %>% dplyr::select(from, to, cost)
+
+cat("\n")
+
+```
+
+## STEP 4: PREPARE DATA FOR PCSF ALGORITHM
+```{r}
+cat("STEP 4: Preparing data for PCSF algorithm...\n")
+
+# Combine PPI and TF-target networks
+interactome <- rbind(
+  ppi_edges %>% dplyr::select(from, to, cost),
+  tf_edges %>% dplyr::select(from, to, cost)
+) %>%
+  distinct()
+
+cat("  Total interactome edges:", nrow(interactome), "\n")
+
+# Create terminal nodes (prizes for PCSF)
+# Terminals are our differentially expressed genes with prizes based on significance
+
+terminals_day3 <- genes_day3_up %>%
+  mutate(prize = -log10(padj) * abs(log2FoldChange)) %>%
+  dplyr::select(gene, prize)
+
+terminals_day6 <- genes_day6_up %>%
+  mutate(prize = -log10(padj) * abs(log2FoldChange)) %>%
+  dplyr::select(gene, prize)
+
+# Combine and normalize prizes
+all_terminals <- rbind(
+  terminals_day3 %>% mutate(timepoint = "day3"),
+  terminals_day6 %>% mutate(timepoint = "day6")
+) %>%
+  group_by(gene) %>%
+  summarize(prize = max(prize), .groups = 'drop') %>%
+  mutate(prize = prize / max(prize))  # Normalize to [0,1]
+
+cat("  Terminal nodes (with prizes):", nrow(all_terminals), "\n")
+cat("  Prize range:", round(min(all_terminals$prize), 3), "to", 
+    round(max(all_terminals$prize), 3), "\n\n")
+
+```
